@@ -92,4 +92,292 @@
 /* ===========================
    1) CONFIGURA FIREBASE QUI
    =========================== */
-// Vai su console.firebase.google.com → c
+// Vai su console.firebase.google.com → crea progetto → Realtime Database → copia la tua config:
+const firebaseConfig = {
+  // TODO: incolla qui la tua config Firebase (apiKey, authDomain, databaseURL, projectId, storageBucket, messagingSenderId, appId)
+};
+
+// ====== DOM/STATE ======
+const qs = s => document.querySelector(s);
+const roomNameEl = qs('#roomName');
+const selfNameEl = qs('#selfName');
+const statusEl = qs('#status');
+const questionBox = qs('#questionBox');
+const questionEl = qs('#question');
+const voteBox = qs('#voteBox');
+const playersEl = qs('#players');
+const btnVote = qs('#btnVote');
+const progressBox = qs('#progressBox');
+const progNums = qs('#progNums');
+const resultsBox = qs('#resultsBox');
+const resultsList = qs('#resultsList');
+const btnStart = qs('#btnStart');
+const btnNext = qs('#btnNext');
+
+// Ricava roomId da ?r= o #room o path /r/room
+function getRoomId() {
+  const params = new URLSearchParams(location.search);
+  if (params.get('r')) return params.get('r').slice(0,100);
+  if (params.get('room')) return params.get('room').slice(0,100);
+  const h = (location.hash || '').replace(/^#/, '');
+  if (h) return h.slice(0,100);
+  const m = location.pathname.match(/\/r\/([^\/]+)/);
+  if (m) return decodeURIComponent(m[1]).slice(0,100);
+  return 'default';
+}
+const roomId = getRoomId();
+roomNameEl.textContent = `Stanza: ${roomId}`;
+
+// Etichette anonime
+const ANIMALS = ["Volpe","Gufo","Lupo","Gatto","Cervo","Aquila","Delfino","Panda","Istrice","Tasso","Lontra","Falco","Riccio","Koala","Lince","Canguro","Orca","Squalo","Ghepardo","Tartaruga"];
+function makeLabel(existing) {
+  for (let i=0;i<2000;i++) {
+    const a = ANIMALS[Math.floor(Math.random()*ANIMALS.length)];
+    const n = Math.floor(Math.random()*90)+10;
+    const c = `${a} ${n}`;
+    if (!existing.has(c)) return c;
+  }
+  return `Anon-${Math.random().toString(36).slice(2,8)}`;
+}
+
+// Domande
+const QUESTIONS = [
+  "Chi è più puntuale?",
+  "Chi sopravviverebbe più a lungo su un'isola deserta?",
+  "Chi cucina meglio?",
+  "Chi è più competitivo?",
+  "Chi è più probabile che dimentichi un compleanno?",
+  "Chi racconta le storie più divertenti?",
+  "Chi ha più sangue freddo nelle emergenze?",
+  "Chi è più nottambulo?",
+  "Chi farebbe il detective migliore?",
+  "Chi è più organizzato?",
+  "Chi è più creativo?",
+  "Chi è più avventuroso?",
+  "Chi è più ironico?",
+  "Chi si perde più facilmente?",
+  "Chi è più diplomatico?",
+  "Chi ha più spirito di iniziativa?",
+  "Chi è più incline al rischio?",
+  "Chi è più paziente?",
+  "Chi è più tecnologico?",
+  "Chi è più empatico?"
+];
+
+// Stato locale
+let app, db, auth, uid=null, myLabel='…';
+let participants = new Map(); // id -> {label}
+let state = { phase:'idle', round:0, question:'', expectedVoters:{} };
+let votes = {}; // uid -> targetId
+let selectedTarget = null;
+let hasVoted = false;
+
+// UI helpers
+function setStatus(txt){ statusEl.textContent = `Stato: ${txt}`; }
+function showVotingUI(q){
+  questionEl.textContent = q || '—';
+  questionBox.classList.remove('hidden');
+  voteBox.classList.remove('hidden');
+  resultsBox.classList.add('hidden');
+  progressBox.classList.remove('hidden');
+  hasVoted = false; selectedTarget=null; btnVote.disabled = true;
+  renderPlayersForVote();
+}
+function showResults(resultsMap){
+  // resultsMap: { uid: {label, votes} }
+  resultsList.innerHTML = '';
+  const arr = Object.entries(resultsMap||{}).map(([id, obj]) => ({id, label: obj.label, votes: obj.votes||0}));
+  arr.sort((a,b)=>b.votes-a.votes);
+  for(const item of arr){
+    const li = document.createElement('li');
+    li.textContent = `${item.label} — ${item.votes}`;
+    resultsList.appendChild(li);
+  }
+  resultsBox.classList.remove('hidden');
+  voteBox.classList.add('hidden');
+  progressBox.classList.add('hidden');
+}
+function renderPlayersForVote(){
+  playersEl.innerHTML = '';
+  const list = Array.from(participants.values()).filter(p => p.id !== uid);
+  for(const p of list){
+    const id = `p_${p.id}`;
+    const label = document.createElement('label');
+    label.className='player';
+    label.innerHTML = `<input type="radio" name="target" id="${id}" value="${p.id}"> ${p.label}`;
+    label.querySelector('input').addEventListener('change', (e)=>{
+      selectedTarget = e.target.value;
+      btnVote.disabled = !selectedTarget || hasVoted;
+    });
+    playersEl.appendChild(label);
+  }
+}
+
+// Firebase init + join
+async function init(){
+  if(!firebaseConfig || !firebaseConfig.apiKey){
+    alert('Config Firebase mancante: edita il file e incolla la tua configurazione.');
+    return;
+  }
+  app = firebase.initializeApp(firebaseConfig);
+  auth = firebase.auth();
+  db = firebase.database();
+
+  // Anonymous auth
+  const cred = await auth.signInAnonymously();
+  uid = cred.user.uid;
+
+  // Prendi etichetta unica
+  const partSnap = await db.ref(`rooms/${roomId}/participants`).get();
+  const existingLabels = new Set();
+  if (partSnap.exists()) {
+    Object.values(partSnap.val()).forEach(p => { if (p && p.label) existingLabels.add(p.label); });
+  }
+  myLabel = makeLabel(existingLabels);
+  selfNameEl.textContent = `Tu: ${myLabel}`;
+
+  // Registra presenza + onDisconnect
+  const meRef = db.ref(`rooms/${roomId}/participants/${uid}`);
+  await meRef.set({ label: myLabel, joinedAt: firebase.database.ServerValue.TIMESTAMP });
+  meRef.onDisconnect().remove();
+
+  // Listeners
+  db.ref(`rooms/${roomId}/participants`).on('value', snap=>{
+    const val = snap.val() || {};
+    const prevIds = new Set(participants.keys());
+    participants = new Map(Object.entries(val).map(([id, v])=>[id,{id, label: v.label}]));
+
+    // Se in votazione, rimuovi disconnessi da expectedVoters (se non hanno votato)
+    if (state.phase === 'voting') {
+      for(const oldId of prevIds){
+        if(!participants.has(oldId) && state.expectedVoters && state.expectedVoters[oldId]){
+          // prova a togliere da expectedVoters
+          db.ref(`rooms/${roomId}/state/expectedVoters/${oldId}`).remove();
+        }
+      }
+      // Aggiorna lista candidati
+      renderPlayersForVote();
+    }
+  });
+
+  db.ref(`rooms/${roomId}/state`).on('value', snap=>{
+    state = Object.assign({phase:'idle', round:0, question:'', expectedVoters:{}}, snap.val()||{});
+    if (state.phase === 'voting') {
+      setStatus('votazione in corso');
+      showVotingUI(state.question);
+      const total = state.expectedVoters ? Object.keys(state.expectedVoters).length : 0;
+      const voted = votes ? Object.keys(votes).length : 0;
+      progNums.textContent = `${voted}/${total}`;
+    } else if (state.phase === 'results') {
+      setStatus('classifica visibile');
+      questionEl.textContent = state.question || '';
+      questionBox.classList.remove('hidden');
+    } else {
+      setStatus('in attesa');
+      questionBox.classList.add('hidden');
+      voteBox.classList.add('hidden');
+      progressBox.classList.add('hidden');
+      resultsBox.classList.add('hidden');
+    }
+  });
+
+  db.ref(`rooms/${roomId}/votes`).on('value', snap=>{
+    votes = snap.val() || {};
+    if (state.phase === 'voting') maybeFinish();
+    const total = state.expectedVoters ? Object.keys(state.expectedVoters).length : 0;
+    const voted = votes ? Object.keys(votes).length : 0;
+    progNums.textContent = `${voted}/${total}`;
+    progressBox.classList.toggle('hidden', state.phase!=='voting');
+  });
+
+  db.ref(`rooms/${roomId}/results`).on('value', snap=>{
+    const res = snap.val();
+    if (res && state.phase === 'results') {
+      showResults(res.tally || {});
+    }
+  });
+
+  // UI ready
+  questionBox.classList.add('hidden');
+  voteBox.classList.add('hidden');
+  resultsBox.classList.add('hidden');
+  progressBox.classList.add('hidden');
+  btnStart.disabled = false;
+  btnNext.disabled = false;
+}
+
+// Avvio round
+async function startRound(){
+  if (!uid) return;
+  // Crea mappa expectedVoters dagli attuali partecipanti
+  const ev = {};
+  for(const id of participants.keys()){ ev[id]=true; }
+  const nextRound = (state.round || 0) + 1;
+  const question = QUESTIONS[Math.floor(Math.random()*QUESTIONS.length)];
+
+  const updates = {};
+  updates[`rooms/${roomId}/state/phase`] = 'voting';
+  updates[`rooms/${roomId}/state/round`] = nextRound;
+  updates[`rooms/${roomId}/state/question`] = question;
+  updates[`rooms/${roomId}/state/expectedVoters`] = ev;
+  updates[`rooms/${roomId}/state/startedAt`] = firebase.database.ServerValue.TIMESTAMP;
+  updates[`rooms/${roomId}/votes`] = null;
+  updates[`rooms/${roomId}/results`] = null;
+
+  await db.ref().update(updates);
+}
+
+// Voto
+async function castVote(targetId){
+  if (!targetId || hasVoted) return;
+  // Evita auto-voto client-side
+  if (targetId === uid) { alert('Non puoi votare te stesso.'); return; }
+  // Scrivi solo se non esiste già (transaction)
+  const myVoteRef = db.ref(`rooms/${roomId}/votes/${uid}`);
+  await myVoteRef.transaction(curr => curr ? curr : targetId);
+  hasVoted = true; btnVote.disabled = true;
+  setStatus('voto registrato, in attesa degli altri…');
+}
+
+// Chiusura automatica quando tutti hanno votato
+async function maybeFinish(){
+  if (state.phase !== 'voting') return;
+  const expectedCount = state.expectedVoters ? Object.keys(state.expectedVoters).length : 0;
+  const votedCount = votes ? Object.keys(votes).length : 0;
+  if (expectedCount>0 && votedCount >= expectedCount){
+    // Prova a passare a results (solo un client "vince")
+    const phaseRef = db.ref(`rooms/${roomId}/state/phase`);
+    const tx = await phaseRef.transaction(curr => (curr==='voting' ? 'results' : curr));
+    if (tx.committed && tx.snapshot.val()==='results') {
+      // Siamo noi i "vincitori": calcola classifica e scrivi results
+      const counts = {};
+      for(const id of Object.keys(state.expectedVoters||{})){ counts[id]=0; }
+      for(const [voter, target] of Object.entries(votes||{})){
+        if (counts.hasOwnProperty(target)) counts[target] = (counts[target]||0)+1;
+      }
+      const tally = {};
+      for(const id of Object.keys(state.expectedVoters||{})){
+        const p = participants.get(id);
+        tally[id] = { label: p ? p.label : id, votes: counts[id]||0 };
+      }
+      await db.ref(`rooms/${roomId}/results`).set({
+        tally,
+        totalVoters: expectedCount,
+        closedAt: firebase.database.ServerValue.TIMESTAMP
+      });
+    }
+  }
+}
+
+// Eventi UI
+btnStart.addEventListener('click', startRound);
+btnNext.addEventListener('click', startRound);
+btnVote.addEventListener('click', ()=> {
+  if (!selectedTarget) return;
+  castVote(selectedTarget);
+});
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
